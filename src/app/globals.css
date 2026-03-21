@@ -1,0 +1,164 @@
+/* src/app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --blue: #3b82f6;
+    --blue-light: #93c5fd;
+    --blue-dark: #1d4ed8;
+    --dark: #0a0a0a;
+    --dark-surface: #141414;
+    --dark-border: #222222;
+    --text-primary: #ffffff;
+    --text-secondary: #a0a0a0;
+    --text-muted: #555555;
+  }
+
+  * {
+    border-color: var(--dark-border);
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--dark);
+    color: var(--text-primary);
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--dark);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--dark-border);
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--blue-dark);
+  }
+
+  /* Selection */
+  ::selection {
+    background: rgba(59, 130, 246, 0.25);
+    color: var(--blue-light);
+  }
+}
+
+@layer components {
+  /* Blue text gradient */
+  .text-blue-gradient {
+    background: linear-gradient(135deg, #3b82f6 0%, #93c5fd 50%, #1d4ed8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Card base */
+  .card-dark {
+    @apply bg-dark-100 border border-zinc-850 rounded-xl;
+    box-shadow: 0 4px 40px rgba(0, 0, 0, 0.5);
+  }
+
+  /* Glow border on hover */
+  .hover-blue-border {
+    @apply border border-transparent transition-all duration-300;
+  }
+  .hover-blue-border:hover {
+    border-color: rgba(59, 130, 246, 0.4);
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.1);
+  }
+
+  /* Button primary */
+  .btn-blue {
+    @apply relative inline-flex items-center justify-center gap-2 px-6 py-3 font-body font-semibold text-sm tracking-wide rounded-lg overflow-hidden transition-all duration-300;
+    background: linear-gradient(135deg, #3b82f6 0%, #93c5fd 50%, #3b82f6 100%);
+    background-size: 200% auto;
+    color: #0a0a0a;
+  }
+  .btn-blue:hover {
+    background-position: right center;
+    box-shadow: 0 0 24px rgba(59, 130, 246, 0.4);
+    transform: translateY(-1px);
+  }
+  .btn-blue:active {
+    transform: translateY(0);
+  }
+
+  /* Button ghost */
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 font-body font-medium text-sm rounded-lg border border-zinc-800 text-zinc-400 transition-all duration-200;
+  }
+  .btn-ghost:hover {
+    @apply border-zinc-600 text-white;
+  }
+
+  /* Noise texture overlay */
+  .noise-overlay::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    opacity: 0.03;
+  }
+
+  /* Animated underline */
+  .underline-blue {
+    @apply relative;
+  }
+  .underline-blue::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 0;
+    width: 0;
+    height: 1px;
+    background: var(--blue);
+    transition: width 0.3s ease;
+  }
+  .underline-blue:hover::after {
+    width: 100%;
+  }
+
+  /* Waveform bars */
+  .waveform-bar {
+    @apply w-0.5 rounded-full;
+    background: var(--blue);
+    animation: waveform 1.2s ease-in-out infinite;
+  }
+  .waveform-bar:nth-child(2) { animation-delay: 0.1s; }
+  .waveform-bar:nth-child(3) { animation-delay: 0.2s; }
+  .waveform-bar:nth-child(4) { animation-delay: 0.3s; }
+  .waveform-bar:nth-child(5) { animation-delay: 0.2s; }
+
+  /* Section fade in */
+  .animate-section {
+    animation: fadeUp 0.7s ease forwards;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .border-blue-dim {
+    border-color: rgba(59, 130, 246, 0.2);
+  }
+
+  .bg-blue-dim {
+    background-color: rgba(59, 130, 246, 0.08);
+  }
+
+  .bg-blue-glow {
+    background: radial-gradient(ellipse at center, rgba(59,130,246,0.15) 0%, transparent 70%);
+  }
+}
