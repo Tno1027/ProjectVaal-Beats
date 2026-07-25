@@ -1,0 +1,383 @@
+// =============================================================================
+// CRT Model V1  |  Candle Range Theory / Candle Range Trap
+// -----------------------------------------------------------------------------
+// Higher-timeframe reference candle -> CRT range on lower timeframe.
+// Wick-only sweep -> reclaim -> pivot-based CHOCH (+ optional BOS) confirmation.
+// Strict body-close invalidation. Non-repainting. Phone-alert ready.
+// Pine Script v6
+// =============================================================================
+//@version=6
+indicator("CRT Model V1", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+// =============================================================================
+// SECTION 10 — USER INPUTS
+// =============================================================================
+
+// ---- Core Inputs -----------------------------------------------------------
+grpCore          = "Core"
+refTF            = input.timeframe("60",  "Reference Timeframe",                 group = grpCore)
+lookbackN        = input.int(5, "Structure Lookback N (fallback)",  minval = 1, group = grpCore, tooltip = "Kept for compatibility. Actual confirmation uses pivots.")
+strictWick       = input.bool(true,  "Strict Wick-Only Sweep",                   group = grpCore, tooltip = "Requires both open and close inside the range (only the wick pierces).")
+replaceOnHTF     = input.bool(false, "Replace CRT Immediately on new HTF close", group = grpCore, tooltip = "If false, current CRT cycle must finish (confirm/invalidate) before a new HTF candle can replace it.")
+resetOnConfirm   = input.bool(true,  "Reset After Confirmation",                 group = grpCore)
+resetOnInvalid   = input.bool(true,  "Reset After Invalidation",                 group = grpCore)
+
+// ---- Pivot / Confirmation Inputs -------------------------------------------
+grpConfirm       = "Confirmation (Pivot / CHOCH / BOS)"
+pivotLen         = input.int(3, "Pivot Length (left = right)",  minval = 1, group = grpConfirm, tooltip = "ta.pivothigh/low length. Larger = stronger swings, slower.")
+requireBOS       = input.bool(false, "Require BOS after CHOCH",                  group = grpConfirm, tooltip = "If ON, setup is only 'confirmed' after CHOCH followed by a Break of Structure in the same direction.")
+useReclaimStart  = input.bool(true,  "Anchor confirmation swings AFTER reclaim", group = grpConfirm, tooltip = "If ON, only pivots forming after the reclaim bar are used. If OFF, pivots from after the sweep are used.")
+
+// ---- Display Inputs --------------------------------------------------------
+grpDisp          = "Display"
+showLevels       = input.bool(true,  "Show CRT High/Low",                        group = grpDisp)
+showFill         = input.bool(true,  "Show CRT Range Fill",                      group = grpDisp)
+showSweep        = input.bool(true,  "Show Sweep Markers",                       group = grpDisp)
+showReclaim      = input.bool(true,  "Show Reclaim Markers",                     group = grpDisp)
+showConfirm      = input.bool(true,  "Show Confirmation Markers",                group = grpDisp)
+showInvalid      = input.bool(true,  "Show Invalidation Markers",                group = grpDisp)
+showBg           = input.bool(true,  "Show State Background",                    group = grpDisp)
+extendUntilReset = input.bool(true,  "Extend CRT Levels Until Reset",            group = grpDisp)
+keepInvalidated  = input.bool(false, "Keep Invalidated Levels Until Next HTF",   group = grpDisp)
+showDebug        = input.bool(false, "Show Debug Label",                         group = grpDisp)
+
+// ---- Style Inputs ----------------------------------------------------------
+grpStyle         = "Style"
+bullColor        = input.color(color.new(color.lime,   0), "Bullish Color",      group = grpStyle)
+bearColor        = input.color(color.new(color.red,    0), "Bearish Color",      group = grpStyle)
+neutralColor     = input.color(color.new(color.gray,   0), "Neutral Color",      group = grpStyle)
+lineWidth        = input.int(2, "CRT Line Width", minval = 1, maxval = 5,         group = grpStyle)
+
+// ---- Alert Control Inputs --------------------------------------------------
+grpAlerts        = "Alerts"
+enableSweepAl    = input.bool(true, "Enable Sweep Alerts",         group = grpAlerts)
+enableArmedAl    = input.bool(true, "Enable Armed Alerts",         group = grpAlerts)
+enableConfAl     = input.bool(true, "Enable Confirmation Alerts",  group = grpAlerts)
+enableInvalAl    = input.bool(true, "Enable Invalidation Alerts",  group = grpAlerts)
+enableRangeAl    = input.bool(true, "Enable New Range Alerts",     group = grpAlerts)
+
+// =============================================================================
+// SAFETY: warn if chart TF >= reference TF
+// =============================================================================
+tfError = timeframe.in_seconds(refTF) <= timeframe.in_seconds(timeframe.period)
+var label warnLbl = na
+if barstate.islast and tfError
+    if na(warnLbl)
+        warnLbl := label.new(bar_index, high, "CRT Model V1: chart TF (" + timeframe.period + ") should be LOWER than reference TF (" + refTF + ")", style = label.style_label_down, color = color.new(color.orange, 0), textcolor = color.white)
+    else
+        label.set_xy(warnLbl, bar_index, high)
+
+// =============================================================================
+// SECTION 2 — HIGHER TIMEFRAME RETRIEVAL (non-repainting)
+// =============================================================================
+// Use previous closed HTF bar via [1] on request.security with no lookahead.
+// This guarantees only fully closed HTF candles are used.
+[htfHigh, htfLow, htfOpen, htfClose, htfTime] = request.security(syminfo.tickerid, refTF, [high[1], low[1], open[1], close[1], time[1]], lookahead = barmerge.lookahead_off)
+
+// Detect a fresh HTF candle close (its "time" bumps up on the LTF stream)
+var int lastHtfTime = na
+newHtfCandle = not na(htfTime) and htfTime != lastHtfTime
+if newHtfCandle
+    lastHtfTime := htfTime
+
+// =============================================================================
+// SECTION 8 — STATE MACHINE (enum-like ints)
+// =============================================================================
+// 0 idle, 1 watching, 2 armed bullish, 3 armed bearish,
+// 4 confirmed bullish, 5 confirmed bearish,
+// 6 invalidated bullish, 7 invalidated bearish
+var int state = 0
+
+// Persistent CRT levels + lifecycle bookkeeping
+var float crtHigh     = na
+var float crtLow      = na
+var int   crtStartBar = na
+var int   sweepBar    = na
+var int   reclaimBar  = na
+var bool  bullSwept   = false
+var bool  bearSwept   = false
+var bool  chochDone   = false   // CHOCH achieved (used when BOS is required for confirm)
+
+// =============================================================================
+// SECTION 2/3 — CRT RANGE UPDATE
+// =============================================================================
+// Replacement rules:
+//   - replaceOnHTF = true  -> always replace on new HTF close
+//   - replaceOnHTF = false -> only replace if state is idle/watching or invalidated
+canReplace = replaceOnHTF or state == 0 or state == 1 or state == 6 or state == 7
+newRangeLoaded = false
+if newHtfCandle and canReplace and not na(htfHigh) and not na(htfLow)
+    crtHigh     := htfHigh
+    crtLow      := htfLow
+    crtStartBar := bar_index
+    sweepBar    := na
+    reclaimBar  := na
+    bullSwept   := false
+    bearSwept   := false
+    chochDone   := false
+    state       := 1              // watching
+    newRangeLoaded := true
+
+haveRange = not na(crtHigh) and not na(crtLow)
+
+// =============================================================================
+// SECTION 4/5 — SWEEP DETECTION (wick-only)
+// =============================================================================
+// Sweep is evaluated on confirmed bars only, per non-repainting spec.
+bullishSweep = false
+bearishSweep = false
+if haveRange and barstate.isconfirmed and (state == 1 or state == 2 or state == 3)
+    // Bullish sweep = wick under CRT low, close (and open if strict) back inside
+    wickBelow = low < crtLow
+    closedInside = close >= crtLow
+    openedInside = open  >= crtLow
+    bullishSweep := wickBelow and closedInside and (not strictWick or openedInside) and not bullSwept
+
+    // Bearish sweep = wick above CRT high, close (and open if strict) back inside
+    wickAbove = high > crtHigh
+    closedInsideB = close <= crtHigh
+    openedInsideB = open  <= crtHigh
+    bearishSweep := wickAbove and closedInsideB and (not strictWick or openedInsideB) and not bearSwept
+
+// =============================================================================
+// SECTION 4/5 — RECLAIM DETECTION (separate from sweep)
+// =============================================================================
+// If the sweeping candle already closed back inside, that IS the reclaim.
+// If a later candle closes back inside first, that is the reclaim.
+bullishReclaim = false
+bearishReclaim = false
+if barstate.isconfirmed and haveRange
+    if bullSwept and na(reclaimBar) and close > crtLow
+        bullishReclaim := true
+    if bearSwept and na(reclaimBar) and close < crtHigh
+        bearishReclaim := true
+
+// =============================================================================
+// SECTION 7 — CONFIRMATION LOGIC (pivot-based CHOCH + optional BOS)
+// =============================================================================
+// Pivots are only detected `pivotLen` bars after the fact -> non-repainting.
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow (low , pivotLen, pivotLen)
+
+// Track most recent confirmed swings AFTER the anchor bar (reclaim or sweep).
+var float lastSwingHigh   = na
+var int   lastSwingHighBar = na
+var float lastSwingLow    = na
+var int   lastSwingLowBar  = na
+var float prevSwingHigh   = na   // for BOS (need a prior swing high above which to break)
+var float prevSwingLow    = na   // for BOS
+
+// The bar at which the actual pivot occurred is bar_index - pivotLen.
+pivotOccurBar = bar_index - pivotLen
+
+// Reset swing memory whenever a fresh CRT cycle begins
+if newRangeLoaded
+    lastSwingHigh   := na
+    lastSwingHighBar := na
+    lastSwingLow    := na
+    lastSwingLowBar  := na
+    prevSwingHigh   := na
+    prevSwingLow    := na
+
+anchorBar = useReclaimStart ? reclaimBar : sweepBar
+
+// Only count pivots whose actual bar >= anchorBar (skip pivots before setup)
+countPivots = not na(anchorBar) and pivotOccurBar >= anchorBar
+
+if not na(ph) and countPivots
+    prevSwingHigh   := lastSwingHigh
+    lastSwingHigh   := ph
+    lastSwingHighBar := pivotOccurBar
+if not na(pl) and countPivots
+    prevSwingLow    := lastSwingLow
+    lastSwingLow    := pl
+    lastSwingLowBar  := pivotOccurBar
+
+// CHOCH definition (post-sweep/reclaim):
+//   Bullish CHOCH  = close breaks above the most recent confirmed swing high
+//                    that formed after anchor.
+//   Bearish CHOCH  = close breaks below the most recent confirmed swing low
+//                    that formed after anchor.
+bullishCHOCH = false
+bearishCHOCH = false
+if barstate.isconfirmed
+    if state == 2 and not na(lastSwingHigh) and close > lastSwingHigh
+        bullishCHOCH := true
+    if state == 3 and not na(lastSwingLow)  and close < lastSwingLow
+        bearishCHOCH := true
+
+// BOS = a further break beyond a NEW swing formed after CHOCH.
+// We reuse the lastSwing* rolling values: once CHOCH is registered we require
+// a NEW pivot (which becomes lastSwing*) to be broken.
+var int chochBar = na
+if bullishCHOCH and not chochDone
+    chochDone := true
+    chochBar  := bar_index
+    // reset swing anchor: only NEW pivots after chochBar count for BOS
+    lastSwingHigh := na
+    lastSwingLow  := na
+if bearishCHOCH and not chochDone
+    chochDone := true
+    chochBar  := bar_index
+    lastSwingHigh := na
+    lastSwingLow  := na
+
+bullishBOS = false
+bearishBOS = false
+if barstate.isconfirmed and chochDone and not na(chochBar)
+    if state == 2 and not na(lastSwingHigh) and lastSwingHighBar > chochBar and close > lastSwingHigh
+        bullishBOS := true
+    if state == 3 and not na(lastSwingLow)  and lastSwingLowBar  > chochBar and close < lastSwingLow
+        bearishBOS := true
+
+// Final confirmation logic
+bullishConfirm = requireBOS ? bullishBOS : bullishCHOCH
+bearishConfirm = requireBOS ? bearishBOS : bearishCHOCH
+
+// =============================================================================
+// SECTION 6 — INVALIDATION LOGIC (body close through opposite/original boundary)
+// =============================================================================
+bullishInvalidate = false
+bearishInvalidate = false
+if barstate.isconfirmed and haveRange
+    // Bullish invalid: confirmed body close BELOW CRT low before confirm
+    if (state == 1 or state == 2) and close < crtLow
+        bullishInvalidate := true
+    // Bearish invalid: confirmed body close ABOVE CRT high before confirm
+    if (state == 1 or state == 3) and close > crtHigh
+        bearishInvalidate := true
+
+// =============================================================================
+// STATE TRANSITIONS
+// =============================================================================
+// Apply in a strict order: sweep -> reclaim -> confirm/invalidate.
+if barstate.isconfirmed and haveRange
+    // ---- Sweep bookkeeping ----
+    if bullishSweep
+        bullSwept := true
+        sweepBar  := bar_index
+    if bearishSweep
+        bearSwept := true
+        sweepBar  := bar_index
+
+    // ---- Reclaim -> armed ----
+    if bullishReclaim and state != 4 and state != 5
+        reclaimBar := bar_index
+        state      := 2   // armed bullish
+    if bearishReclaim and state != 4 and state != 5
+        reclaimBar := bar_index
+        state      := 3   // armed bearish
+
+    // If sweep happened AND same-candle already reclaimed (close back inside),
+    // arm immediately on this bar.
+    if bullishSweep and close > crtLow and state != 4 and state != 5
+        reclaimBar := bar_index
+        state      := 2
+    if bearishSweep and close < crtHigh and state != 4 and state != 5
+        reclaimBar := bar_index
+        state      := 3
+
+    // ---- Confirmations (only from armed states) ----
+    if state == 2 and bullishConfirm
+        state := 4   // confirmed bullish
+    if state == 3 and bearishConfirm
+        state := 5   // confirmed bearish
+
+    // ---- Invalidations (only from watching / armed states) ----
+    if bullishInvalidate and (state == 1 or state == 2)
+        state := 6   // invalidated bullish
+    if bearishInvalidate and (state == 1 or state == 3)
+        state := 7   // invalidated bearish
+
+// One-bar auto-reset after terminal states (so the machine returns to idle/watching
+// and waits for the next HTF replacement per user prefs).
+if barstate.isconfirmed
+    if (state == 4 and resetOnConfirm) or (state == 5 and resetOnConfirm)
+        state       := 0
+        if not extendUntilReset
+            crtHigh := na
+            crtLow  := na
+    if (state == 6 and resetOnInvalid) or (state == 7 and resetOnInvalid)
+        state       := 0
+        if not keepInvalidated
+            crtHigh := na
+            crtLow  := na
+
+// =============================================================================
+// SECTION 11 — PLOTTING
+// =============================================================================
+plotHigh = showLevels and haveRange ? crtHigh : na
+plotLow  = showLevels and haveRange ? crtLow  : na
+
+pHi = plot(plotHigh, "CRT High", color = neutralColor, linewidth = lineWidth, style = plot.style_linebr)
+pLo = plot(plotLow,  "CRT Low",  color = neutralColor, linewidth = lineWidth, style = plot.style_linebr)
+fill(pHi, pLo, color = showFill and haveRange ? color.new(neutralColor, 90) : na, title = "CRT Fill")
+
+// Markers
+plotshape(showSweep and bullishSweep, title = "Bullish Sweep",  style = shape.triangleup,   location = location.belowbar, color = bullColor, size = size.tiny,  text = "SW")
+plotshape(showSweep and bearishSweep, title = "Bearish Sweep",  style = shape.triangledown, location = location.abovebar, color = bearColor, size = size.tiny,  text = "SW")
+
+plotshape(showReclaim and bullishReclaim, title = "Bullish Reclaim", style = shape.circle, location = location.belowbar, color = bullColor, size = size.tiny, text = "RC")
+plotshape(showReclaim and bearishReclaim, title = "Bearish Reclaim", style = shape.circle, location = location.abovebar, color = bearColor, size = size.tiny, text = "RC")
+
+plotshape(showConfirm and bullishConfirm, title = "Bullish Confirm", style = shape.triangleup,   location = location.belowbar, color = bullColor, size = size.small, text = requireBOS ? "BOS" : "CHOCH", textcolor = color.white)
+plotshape(showConfirm and bearishConfirm, title = "Bearish Confirm", style = shape.triangledown, location = location.abovebar, color = bearColor, size = size.small, text = requireBOS ? "BOS" : "CHOCH", textcolor = color.white)
+
+plotshape(showInvalid and bullishInvalidate, title = "Bullish Invalidated", style = shape.xcross, location = location.belowbar, color = bearColor, size = size.small)
+plotshape(showInvalid and bearishInvalidate, title = "Bearish Invalidated", style = shape.xcross, location = location.abovebar, color = bullColor, size = size.small)
+
+// State background
+bgTint = state == 2 ? color.new(bullColor, 90) : state == 3 ? color.new(bearColor, 90) : state == 4 ? color.new(bullColor, 75) : state == 5 ? color.new(bearColor, 75) : na
+bgcolor(showBg ? bgTint : na, title = "State Background")
+
+// Debug label
+var label dbg = na
+if showDebug and barstate.islast
+    stateStr = state == 0 ? "idle" : state == 1 ? "watching" : state == 2 ? "armed bullish" : state == 3 ? "armed bearish" : state == 4 ? "confirmed bullish" : state == 5 ? "confirmed bearish" : state == 6 ? "invalidated bullish" : "invalidated bearish"
+    txt = "CRT Model V1\nState: " + stateStr + "\nCRT High: " + (na(crtHigh) ? "-" : str.tostring(crtHigh, format.mintick)) + "\nCRT Low: "  + (na(crtLow)  ? "-" : str.tostring(crtLow,  format.mintick)) + "\nSwept:  " + (bullSwept ? "bull " : "") + (bearSwept ? "bear" : "") + "\nReclaim: " + (na(reclaimBar) ? "no"  : "yes") + "\nCHOCH: "  + (chochDone ? "yes" : "no")
+    if na(dbg)
+        dbg := label.new(bar_index, high, txt, style = label.style_label_left, color = color.new(color.black, 20), textcolor = color.white)
+    else
+        label.set_xy(dbg, bar_index, high)
+        label.set_text(dbg, txt)
+
+// =============================================================================
+// SECTION 12 — PHONE ALERTS (alertcondition, non-repainting, confirmed bars)
+// =============================================================================
+// One boolean per lifecycle event, gated by user enables where practical.
+// Each alertcondition() has a unique title + short mobile-friendly message.
+// All events are computed on barstate.isconfirmed logic above.
+
+// Lifecycle booleans
+bullishSweepAlert       = enableSweepAl and bullishSweep       and barstate.isconfirmed
+bearishSweepAlert       = enableSweepAl and bearishSweep       and barstate.isconfirmed
+bullishArmedAlert       = enableArmedAl and state == 2 and (bullishReclaim or bullishSweep) and barstate.isconfirmed
+bearishArmedAlert       = enableArmedAl and state == 3 and (bearishReclaim or bearishSweep) and barstate.isconfirmed
+bullishConfirmedAlert   = enableConfAl  and bullishConfirm     and barstate.isconfirmed
+bearishConfirmedAlert   = enableConfAl  and bearishConfirm     and barstate.isconfirmed
+bullishInvalidatedAlert = enableInvalAl and bullishInvalidate  and barstate.isconfirmed
+bearishInvalidatedAlert = enableInvalAl and bearishInvalidate  and barstate.isconfirmed
+newRangeAlert           = enableRangeAl and newRangeLoaded     and barstate.isconfirmed
+
+// New CRT range loaded
+alertcondition(newRangeAlert,           title = "CRT | New Range Loaded",   message = "CRT Model V1 | New Range Loaded | {{ticker}} | {{interval}}")
+
+// Sweep detected
+alertcondition(bullishSweepAlert,       title = "CRT | Bullish Sweep",      message = "CRT Model V1 | Bullish Sweep | {{ticker}} | {{interval}}")
+alertcondition(bearishSweepAlert,       title = "CRT | Bearish Sweep",      message = "CRT Model V1 | Bearish Sweep | {{ticker}} | {{interval}}")
+
+// Armed (sweep + reclaim complete)
+alertcondition(bullishArmedAlert,       title = "CRT | Bullish Armed",      message = "CRT Model V1 | Bullish Armed | {{ticker}} | {{interval}}")
+alertcondition(bearishArmedAlert,       title = "CRT | Bearish Armed",      message = "CRT Model V1 | Bearish Armed | {{ticker}} | {{interval}}")
+
+// Confirmed (CHOCH or CHOCH+BOS)
+alertcondition(bullishConfirmedAlert,   title = "CRT | Bullish Confirmed",  message = "CRT Model V1 | Bullish Confirmed | {{ticker}} | {{interval}}")
+alertcondition(bearishConfirmedAlert,   title = "CRT | Bearish Confirmed",  message = "CRT Model V1 | Bearish Confirmed | {{ticker}} | {{interval}}")
+
+// Invalidated (body close through boundary)
+alertcondition(bullishInvalidatedAlert, title = "CRT | Bullish Invalidated", message = "CRT Model V1 | Bullish Invalidated | {{ticker}} | {{interval}}")
+alertcondition(bearishInvalidatedAlert, title = "CRT | Bearish Invalidated", message = "CRT Model V1 | Bearish Invalidated | {{ticker}} | {{interval}}")
+
+// =============================================================================
+// END OF SCRIPT
+// =============================================================================
